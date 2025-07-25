@@ -31,23 +31,27 @@ func NewTelegramDownloader(cfg Config) (*TelegramDownloader, error) {
 		return nil, fmt.Errorf("failed to create download directory: %w", err)
 	}
 
-	return &TelegramDownloader{
-		config: cfg,
-	}, nil
-}
-
-func (td *TelegramDownloader) Connect(ctx context.Context) error {
-	td.client = telegram.NewClient(td.config.AppID, td.config.AppHash, telegram.Options{
+	client := telegram.NewClient(cfg.AppID, cfg.AppHash, telegram.Options{
 		SessionStorage: &session.FileStorage{Path: "session.json"},
 		DialTimeout:    30 * time.Second,
 		RetryInterval:  5 * time.Second,
 		MaxRetries:     3,
 	})
 
+	return &TelegramDownloader{
+		config: cfg,
+		client: client,
+	}, nil
+}
+
+func (td *TelegramDownloader) Connect(ctx context.Context) error {
 	return td.client.Run(ctx, func(ctx context.Context) error {
 		if err := td.auth(ctx); err != nil {
 			return fmt.Errorf("auth failed: %w", err)
 		}
+
+		// Keep the client running by not returning here
+		// The download will be called from within this context
 		return nil
 	})
 }
@@ -92,85 +96,92 @@ func (td *TelegramDownloader) auth(ctx context.Context) error {
 func (td *TelegramDownloader) DownloadChannelMusic(ctx context.Context, channelUsername string, limit int) error {
 	log.Printf("Starting download from channel: @%s", channelUsername)
 
-	api := td.client.API()
+	// Run the client and perform download within the same context
+	return td.client.Run(ctx, func(ctx context.Context) error {
+		if err := td.auth(ctx); err != nil {
+			return fmt.Errorf("auth failed: %w", err)
+		}
 
-	// Get channel info
-	peer, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{
-		Username: channelUsername,
+		api := td.client.API()
+
+		// Get channel info
+		peer, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{
+			Username: channelUsername,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to resolve channel: %w", err)
+		}
+
+		// Convert to input peer
+		var inputPeer tg.InputPeerClass
+		if len(peer.Users) > 0 {
+			if user, ok := peer.Users[0].(*tg.User); ok {
+				inputPeer = &tg.InputPeerUser{
+					UserID:     user.ID,
+					AccessHash: user.AccessHash,
+				}
+			}
+		}
+		if len(peer.Chats) > 0 {
+			if chat, ok := peer.Chats[0].(*tg.Channel); ok {
+				inputPeer = &tg.InputPeerChannel{
+					ChannelID:  chat.ID,
+					AccessHash: chat.AccessHash,
+				}
+			}
+		}
+
+		if inputPeer == nil {
+			return fmt.Errorf("failed to get input peer")
+		}
+
+		// Get channel messages
+		messages, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:      inputPeer,
+			Limit:     limit,
+			AddOffset: 0,
+			OffsetID:  0,
+			MaxID:     0,
+			MinID:     0,
+			Hash:      0,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to get messages: %w", err)
+		}
+
+		downloadedCount := 0
+
+		// Handle different message types
+		switch m := messages.(type) {
+		case *tg.MessagesMessages:
+			for _, msg := range m.Messages {
+				if err := td.processMessage(ctx, msg); err != nil {
+					log.Printf("Error processing message: %v", err)
+				} else {
+					downloadedCount++
+				}
+
+				if limit > 0 && downloadedCount >= limit {
+					break
+				}
+			}
+		case *tg.MessagesChannelMessages:
+			for _, msg := range m.Messages {
+				if err := td.processMessage(ctx, msg); err != nil {
+					log.Printf("Error processing message: %v", err)
+				} else {
+					downloadedCount++
+				}
+
+				if limit > 0 && downloadedCount >= limit {
+					break
+				}
+			}
+		}
+
+		log.Printf("Downloaded %d audio files", downloadedCount)
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("failed to resolve channel: %w", err)
-	}
-
-	// Convert to input peer
-	var inputPeer tg.InputPeerClass
-	if len(peer.Users) > 0 {
-		if user, ok := peer.Users[0].(*tg.User); ok {
-			inputPeer = &tg.InputPeerUser{
-				UserID:     user.ID,
-				AccessHash: user.AccessHash,
-			}
-		}
-	}
-	if len(peer.Chats) > 0 {
-		if chat, ok := peer.Chats[0].(*tg.Channel); ok {
-			inputPeer = &tg.InputPeerChannel{
-				ChannelID:  chat.ID,
-				AccessHash: chat.AccessHash,
-			}
-		}
-	}
-
-	if inputPeer == nil {
-		return fmt.Errorf("failed to get input peer")
-	}
-
-	// Get channel messages
-	messages, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-		Peer:      inputPeer,
-		Limit:     limit,
-		AddOffset: 0,
-		OffsetID:  0,
-		MaxID:     0,
-		MinID:     0,
-		Hash:      0,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to get messages: %w", err)
-	}
-
-	downloadedCount := 0
-
-	// Handle different message types
-	switch m := messages.(type) {
-	case *tg.MessagesMessages:
-		for _, msg := range m.Messages {
-			if err := td.processMessage(ctx, msg); err != nil {
-				log.Printf("Error processing message: %v", err)
-			} else {
-				downloadedCount++
-			}
-
-			if limit > 0 && downloadedCount >= limit {
-				break
-			}
-		}
-	case *tg.MessagesChannelMessages:
-		for _, msg := range m.Messages {
-			if err := td.processMessage(ctx, msg); err != nil {
-				log.Printf("Error processing message: %v", err)
-			} else {
-				downloadedCount++
-			}
-
-			if limit > 0 && downloadedCount >= limit {
-				break
-			}
-		}
-	}
-
-	log.Printf("Downloaded %d audio files", downloadedCount)
-	return nil
 }
 
 func (td *TelegramDownloader) processMessage(ctx context.Context, msg tg.MessageClass) error {

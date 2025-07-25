@@ -65,9 +65,5 @@ func downloadTelegramMusic(channelUsername string, limit int, config *Config) er
 	}
 
 	ctx := context.Background()
-	if err := downloader.Connect(ctx); err != nil {
-		return fmt.Errorf("failed to connect: %w", err)
-	}
-
 	return downloader.DownloadChannelMusic(ctx, channelUsername, limit)
 }

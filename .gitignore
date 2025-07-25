@@ -6,6 +6,7 @@ session.json
 *.dll
 *.so
 *.dylib
+social-content-dl
 
 # Test binary, built with `go test -c`
 *.test
